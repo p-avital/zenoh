@@ -29,3 +29,5 @@ pub(crate) use stack_buffer::*;
 
 pub mod timer;
 pub use timer::*;
+
+pub mod tries;
