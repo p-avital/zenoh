@@ -66,7 +66,7 @@ impl<T> Trie<T> {
     fn split(&mut self, at: u32) {
         let previous_length = self.inner.tag as usize;
         let mut child = Trie {
-            inner: TrieInner::from_bytes(&self.inner.inner[at as usize..previous_length]).0,
+            inner: TrieInner::from_bytes(&self.inner.inner.bytes[at as usize..previous_length]).0,
             children: Vec::with_capacity(2),
         };
         std::mem::swap(&mut self.children, &mut child.children);
@@ -124,6 +124,29 @@ impl<T> Trie<T> {
             | Match::DouleStar { .. } => None,
         }
     }
+    /// Will prune unused branches of the tree, and try to unite string segments that may have been split previously
+    pub fn prune(&mut self) {
+        let mut marked = Vec::new();
+        for (i, child) in &mut self.children.iter_mut().enumerate() {
+            if child.do_prune() {
+                marked.push(i);
+            }
+        }
+        for i in marked.into_iter().rev() {
+            self.children.swap_remove(i);
+        }
+        // TODO: implement shortening
+    }
+    fn do_prune(&mut self) -> bool {
+        match self.inner.tag {
+            TrieInner::<T>::DELETED => true,
+            TrieInner::<T>::LEAF => false,
+            _ => {
+                self.prune();
+                self.children.is_empty()
+            }
+        }
+    }
     pub fn iter<'a, P: AsRef<[u8]>>(&'a self, prefix: &'a P) -> Iter<'a, T> {
         let prefix = prefix.as_ref();
         let iters = match self.inner.match_bytes(prefix) {
@@ -152,7 +175,26 @@ impl<'a, T> IntoIterator for &'a Trie<T> {
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        loop {
+            let (start, iter) = self.iters.last_mut()?;
+            let start = *start;
+            let prefix = &self.prefix[start..];
+            if let Some(node) = iter.next() {
+                match node.inner.match_bytes(prefix) {
+                    Match::NullPrefix => self.iters.push((start, node.children.iter())),
+                    Match::Full(len) => self
+                        .iters
+                        .push((start + len as usize, node.children.iter())),
+                    Match::Leaf if self.prefix.len() == start => return Some(node.inner.as_ref()),
+                    Match::Partial(len) if self.prefix.len() == start + len as usize => self
+                        .iters
+                        .push((start + len as usize, node.children.iter())),
+                    _ => {}
+                }
+            } else {
+                self.iters.pop();
+            }
+        }
     }
 }
 
@@ -195,11 +237,14 @@ fn trie_display() {
         "/panda/roux",
     ];
     for path in paths {
-        trie.insert(path, path.chars().rev().collect());
+        trie.insert(path, path.to_uppercase());
         println!("{}", &trie);
     }
     for path in paths {
         println!("{}", trie.get(dbg!(path)).unwrap());
+    }
+    for value in trie.iter(b"/pan") {
+        dbg!(value);
     }
 }
 impl<T: Sized> From<TrieInner<T>> for Trie<T> {
@@ -215,11 +260,35 @@ impl<T: Sized> Default for Trie<T> {
         Self::new()
     }
 }
+
+struct TrieInnerUnion<T> {
+    bytes: [u8; INNER_SIZE],
+    _marker: std::marker::PhantomData<T>,
+}
+impl<T> TrieInnerUnion<T> {
+    const fn new() -> Self {
+        TrieInnerUnion {
+            bytes: [0; INNER_SIZE],
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+impl<T> Default for TrieInnerUnion<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl<T> From<T> for TrieInnerUnion<T> {
+    fn from(leaf: T) -> Self {
+        let mut this = Self::default();
+        unsafe { std::ptr::write(std::mem::transmute(&mut this.bytes), leaf) }
+        this
+    }
+}
 #[repr(C)]
 struct TrieInner<T> {
-    inner: [u8; INNER_SIZE],
+    inner: TrieInnerUnion<T>,
     tag: u8,
-    _marker: std::marker::PhantomData<T>,
 }
 impl<T: std::fmt::Debug> std::fmt::Display for TrieInner<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,9 +298,9 @@ impl<T: std::fmt::Debug> std::fmt::Display for TrieInner<T> {
             Self::STAR => f.write_str("*/"),
             Self::DOUBLE_STAR => f.write_str("**/"),
             Self::DELETED => f.write_str("DELETED ENTRY"),
-            len => {
-                f.write_str(unsafe { std::str::from_utf8_unchecked(&self.inner[..len as usize]) })
-            }
+            len => f.write_str(unsafe {
+                std::str::from_utf8_unchecked(&self.inner.bytes[..len as usize])
+            }),
         }
     }
 }
@@ -264,12 +333,11 @@ impl<T> TrieInner<T> {
             .unwrap_or_else(|| s.len())
             .min(INNER_SIZE);
         let mut result = TrieInner {
-            inner: [0; INNER_SIZE],
+            inner: TrieInnerUnion::default(),
             tag: split as u8,
-            _marker: std::default::Default::default(),
         };
         let (left, right) = s.split_at(split);
-        result.inner[..split].clone_from_slice(left);
+        result.inner.bytes[..split].clone_from_slice(left);
         (result, right)
     }
     fn match_bytes(&self, rhs: &[u8]) -> Match {
@@ -320,8 +388,8 @@ impl<T> TrieInner<T> {
                     }
                 }
             }
-            length if self.inner[0] == rhs[0] => {
-                for (i, (a, b)) in self.inner[1..length as usize]
+            length if self.inner.bytes[0] == rhs[0] => {
+                for (i, (a, b)) in self.inner.bytes[1..length as usize]
                     .iter()
                     .zip(&rhs[1..])
                     .enumerate()
@@ -330,7 +398,7 @@ impl<T> TrieInner<T> {
                         return Match::Partial((i + 1) as u32);
                     }
                 }
-                Match::Full(length as u32)
+                Match::Full((length as u32).min(rhs.len() as u32))
             }
             _ => Match::Mismatch,
         }
@@ -344,44 +412,33 @@ impl<T> TrieInner<T> {
         self.tag <= INNER_SIZE as u8
     }
     fn leaf(value: T) -> Self {
-        let mut new = TrieInner {
-            inner: [0; INNER_SIZE],
+        TrieInner {
+            inner: TrieInnerUnion::from(value),
             tag: Self::LEAF,
-            _marker: std::marker::PhantomData,
-        };
-        unsafe { std::ptr::copy_nonoverlapping(&value, new.as_mut(), 1) }
-        std::mem::MaybeUninit::new(value);
-        new
+        }
     }
     const fn slash() -> Self {
         TrieInner {
-            inner: [0; INNER_SIZE],
+            inner: TrieInnerUnion::new(),
             tag: Self::SLASH,
-            _marker: std::marker::PhantomData,
         }
     }
     const fn star() -> Self {
         TrieInner {
-            inner: [0; INNER_SIZE],
+            inner: TrieInnerUnion::new(),
             tag: Self::STAR,
-            _marker: std::marker::PhantomData,
         }
     }
     const fn double_star() -> Self {
         TrieInner {
-            inner: [0; INNER_SIZE],
+            inner: TrieInnerUnion::new(),
             tag: Self::DOUBLE_STAR,
-            _marker: std::marker::PhantomData,
         }
     }
     fn take(&mut self) -> Option<T> {
         if self.tag == Self::LEAF {
             self.tag = Self::DELETED;
-            let mut value = std::mem::MaybeUninit::uninit();
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.as_ref(), value.as_mut_ptr(), 1);
-                Some(value.assume_init())
-            }
+            Some(unsafe { std::ptr::read(std::mem::transmute(&mut self.inner.bytes)) })
         } else {
             None
         }
@@ -393,22 +450,33 @@ impl<T> TrieInner<T> {
 }
 impl<T> AsRef<T> for TrieInner<T> {
     fn as_ref(&self) -> &T {
-        unsafe { std::mem::transmute(&self.inner) }
+        unsafe { std::mem::transmute(&self.inner.bytes) }
     }
 }
 impl<T> AsMut<T> for TrieInner<T> {
     fn as_mut(&mut self) -> &mut T {
-        unsafe { std::mem::transmute(&mut self.inner) }
+        unsafe { std::mem::transmute(&mut self.inner.bytes) }
     }
 }
 impl<T> Drop for TrieInner<T> {
     fn drop(&mut self) {
-        if self.tag == Self::LEAF {
-            let mut value = std::mem::MaybeUninit::uninit();
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.as_ref(), value.as_mut_ptr(), 1);
-                std::mem::drop(value.assume_init())
-            }
-        }
+        std::mem::drop(self.take());
     }
+}
+
+/// Ensures that Trie<T> construction panics if T is too large for Trie<T> to keep fitting.
+#[test]
+#[should_panic]
+fn trie_panic_if_too_large() {
+    let impossible_trie: Trie<[u64; 10]> = Trie::new();
+    assert_ne!(std::mem::size_of_val(&impossible_trie), 64);
+}
+
+/// Ensures that any Trie<T> has the exact size of a typical cache line.
+#[test]
+fn trie_check_size() {
+    let trie: Trie<[u64; 4]> = Trie::new();
+    assert_eq!(std::mem::size_of_val(&trie), 64);
+    let trie: Trie<[u8; 4]> = Trie::new();
+    assert_eq!(std::mem::size_of_val(&trie), 64);
 }
