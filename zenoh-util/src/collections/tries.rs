@@ -6,6 +6,9 @@ pub struct Trie<T> {
 }
 
 impl<T> Trie<T> {
+    /// Constructs a new instance of a Trie.
+    ///
+    /// Since values are stored directly on Trie nodes, and to prevent nodes from growing too big, `T` must fit within 39 bytes. If you need to store something bigger, wrap it in an appropriate smart-pointer, such as [`Box`] or [`std::sync::Arc`]
     pub fn new() -> Self
     where
         T: Sized,
@@ -22,42 +25,43 @@ impl<T> Trie<T> {
             children: Vec::new(),
         }
     }
-    pub fn insert<P: AsRef<[u8]>>(&mut self, path: P, value: T) -> Option<T> {
-        let path = path.as_ref();
-        match self.inner.match_bytes(path) {
-            Match::Full(n) => self.do_insert(&path[n as usize..], value),
+    /// Inserts a value at the provided key, returning the previously stored value if it existed (wildcards are treated as litteral strings).
+    pub fn insert<P: AsRef<[u8]>>(&mut self, key: P, value: T) -> Option<T> {
+        let key = key.as_ref();
+        match self.inner.match_bytes(key) {
+            Match::Full(n) => self.do_insert(&key[n as usize..], value),
             _ => None,
         }
     }
-    fn do_insert(&mut self, path: &[u8], mut value: T) -> Option<T> {
+    fn do_insert(&mut self, key: &[u8], mut value: T) -> Option<T> {
         for child in &mut self.children {
-            match child.inner.match_bytes(path) {
+            match child.inner.match_bytes(key) {
                 Match::Partial(len) => {
                     child.split(len);
-                    return child.do_insert(&path[len as usize..], value);
+                    return child.do_insert(&key[len as usize..], value);
                 }
-                Match::Full(0) => {
+                Match::Leaf => {
                     std::mem::swap(&mut value, child.inner.as_mut());
                     return Some(value);
                 }
                 Match::Full(len)
                 | Match::Star { exact: true, len }
                 | Match::DouleStar { exact: true, len } => {
-                    return child.do_insert(&path[len as usize..], value)
+                    return child.do_insert(&key[len as usize..], value)
                 }
                 _ => continue,
             }
         }
         let mut children = &mut self.children;
-        let mut path = path;
-        while !path.is_empty() {
-            let (inner, p) = TrieInner::from_bytes(path);
+        let mut key = key;
+        while !key.is_empty() {
+            let (inner, p) = TrieInner::from_bytes(key);
             let child = Trie {
                 inner,
                 children: Vec::with_capacity(1),
             };
             children.push(child);
-            path = p;
+            key = p;
             children = &mut children.last_mut().unwrap().children;
         }
         children.push(TrieInner::leaf(value).into());
@@ -73,15 +77,42 @@ impl<T> Trie<T> {
         self.inner.tag = at as u8;
         self.children.push(child);
     }
-    pub fn get<P: AsRef<[u8]>>(&self, path: P) -> Option<&T> {
-        let path = path.as_ref();
-        match self.inner.match_bytes(path) {
+    /// Returns `true` if a value exists for `key`. If `GREEDY == false`, will only return `true` if an exact match exist (wildcards are treated as litteral strings).
+    pub fn contains<P: AsRef<[u8]>, const GREEDY: bool>(&self, key: P) -> bool {
+        let key = key.as_ref();
+        match self.inner.match_bytes(key) {
+            Match::Leaf => true,
+            Match::Full(len)
+            | Match::Star { exact: true, len }
+            | Match::DouleStar { exact: true, len } => {
+                let key = &key[len as usize..];
+                self.children
+                    .iter()
+                    .any(|c| c.contains::<&[u8], GREEDY>(key))
+            }
+            Match::Mismatch
+            | Match::NullPrefix
+            | Match::Partial(_)
+            | Match::Star { .. }
+            | Match::DouleStar { .. } => {
+                if GREEDY {
+                    todo!("greedy matching not implemented yet")
+                } else {
+                    false
+                }
+            }
+        }
+    }
+    /// Returns a reference to the matching item if the `key` mathes exactly (wildcards are treaded as litteral strings).
+    pub fn get<P: AsRef<[u8]>>(&self, key: P) -> Option<&T> {
+        let key = key.as_ref();
+        match self.inner.match_bytes(key) {
             Match::Leaf => Some(self.inner.as_ref()),
             Match::Full(len)
             | Match::Star { exact: true, len }
             | Match::DouleStar { exact: true, len } => {
-                let path = &path[len as usize..];
-                self.children.iter().find_map(|c| c.get(path))
+                let key = &key[len as usize..];
+                self.children.iter().find_map(|c| c.get(key))
             }
             Match::Mismatch
             | Match::NullPrefix
@@ -90,15 +121,16 @@ impl<T> Trie<T> {
             | Match::DouleStar { .. } => None,
         }
     }
-    pub fn get_mut<P: AsRef<[u8]>>(&mut self, path: P) -> Option<&mut T> {
-        let path = path.as_ref();
-        match self.inner.match_bytes(path) {
+    /// Returns a mutable reference to the matching item if the `key` mathes exactly (wildcards are treaded as litteral strings).
+    pub fn get_mut<P: AsRef<[u8]>>(&mut self, key: P) -> Option<&mut T> {
+        let key = key.as_ref();
+        match self.inner.match_bytes(key) {
             Match::Leaf => Some(self.inner.as_mut()),
             Match::Full(len)
             | Match::Star { exact: true, len }
             | Match::DouleStar { exact: true, len } => {
-                let path = &path[len as usize..];
-                self.children.iter_mut().find_map(|c| c.get_mut(path))
+                let key = &key[len as usize..];
+                self.children.iter_mut().find_map(|c| c.get_mut(key))
             }
             Match::Mismatch
             | Match::NullPrefix
@@ -107,15 +139,21 @@ impl<T> Trie<T> {
             | Match::DouleStar { .. } => None,
         }
     }
-    pub fn remove<P: AsRef<[u8]>>(&mut self, path: P) -> Option<T> {
-        let path = path.as_ref();
-        match self.inner.match_bytes(path) {
-            Match::Leaf => self.inner.take(),
+    /// Removes an entry, setting a gravestone in its place, using exact matching (wildcards are treaded as litteral strings).
+    ///
+    /// This remove is faster than [`Self::clean_remove`], but requires global cleanup steps to be taken in the future, such as [`Self::prune`]-ing after a few removes.
+    pub fn remove<P: AsRef<[u8]>>(&mut self, key: P) -> Option<T> {
+        let key = key.as_ref();
+        match self.inner.match_bytes(key) {
+            Match::Leaf => {
+                self.inner.tag = TrieInner::<T>::DELETED;
+                Some(unsafe { std::ptr::read(std::mem::transmute(&mut self.inner.inner.bytes)) })
+            }
             Match::Full(len)
             | Match::Star { exact: true, len }
             | Match::DouleStar { exact: true, len } => {
-                let path = &path[len as usize..];
-                self.children.iter_mut().find_map(|c| c.remove(path))
+                let key = &key[len as usize..];
+                self.children.iter_mut().find_map(|c| c.remove(key))
             }
             Match::Mismatch
             | Match::NullPrefix
@@ -124,7 +162,51 @@ impl<T> Trie<T> {
             | Match::DouleStar { .. } => None,
         }
     }
-    /// Will prune unused branches of the tree, and try to unite string segments that may have been split previously
+    /// Removes an entry and applies local pruning to reoptimize the trie, using exact matching (wildcards are treaded as litteral strings).
+    ///
+    /// This operation is slower than [`Self::remove`], but keeps the trie optimized for less costs than [`Self::prune`].
+    pub fn clean_remove<P: AsRef<[u8]>>(&mut self, key: P) -> Option<T> {
+        self.do_clean_remove(key.as_ref()).map(|f| f.0)
+    }
+    fn do_clean_remove(&mut self, key: &[u8]) -> Option<(T, bool)> {
+        match self.inner.match_bytes(key) {
+            Match::Leaf => {
+                self.inner.tag = TrieInner::<T>::DELETED;
+                Some((
+                    unsafe { std::ptr::read(std::mem::transmute(&mut self.inner.inner.bytes)) },
+                    true,
+                ))
+            }
+            Match::Full(len)
+            | Match::Star { exact: true, len }
+            | Match::DouleStar { exact: true, len } => {
+                let key = &key[len as usize..];
+                for i in 0..self.children.len() {
+                    if let Some((value, delete)) =
+                        unsafe { self.children.get_unchecked_mut(i).do_clean_remove(key) }
+                    {
+                        if delete {
+                            self.children.swap_remove(i);
+                            if self.children.is_empty() {
+                                return Some((value, true));
+                            } else {
+                                self.join_child();
+                                return Some((value, false));
+                            }
+                        }
+                        return Some((value, false));
+                    }
+                }
+                None
+            }
+            Match::Mismatch
+            | Match::NullPrefix
+            | Match::Partial(_)
+            | Match::Star { .. }
+            | Match::DouleStar { .. } => None,
+        }
+    }
+    /// Will prune unused branches of the tree, and try to unite string segments that may have been split previously.
     pub fn prune(&mut self) {
         let mut marked = Vec::new();
         for (i, child) in &mut self.children.iter_mut().enumerate() {
@@ -135,7 +217,32 @@ impl<T> Trie<T> {
         for i in marked.into_iter().rev() {
             self.children.swap_remove(i);
         }
-        // TODO: implement shortening
+        self.join_child();
+    }
+    /// Merges node with its single child if possible.
+    fn join_child(&mut self) {
+        if self.inner.is_str()
+            && self.children.len() == 1
+            && self.children[0].inner.is_str()
+            && (self.inner.tag + self.children[0].inner.tag) as usize <= INNER_SIZE
+        {
+            let Trie {
+                inner: child,
+                children,
+            } = match self.children.pop() {
+                Some(val) => val,
+                None => unsafe { std::hint::unreachable_unchecked() },
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &child.inner.bytes as *const u8,
+                    &mut self.inner.inner.bytes[self.inner.tag as usize],
+                    child.tag as usize,
+                )
+            };
+            self.inner.tag += child.tag;
+            self.children = children;
+        }
     }
     fn do_prune(&mut self) -> bool {
         match self.inner.tag {
@@ -147,52 +254,170 @@ impl<T> Trie<T> {
             }
         }
     }
-    pub fn iter<'a, P: AsRef<[u8]>>(&'a self, prefix: &'a P) -> Iter<'a, T> {
-        let prefix = prefix.as_ref();
-        let iters = match self.inner.match_bytes(prefix) {
-            Match::Partial(_)
-            | Match::Star { .. }
-            | Match::DouleStar { .. }
-            | Match::Leaf
-            | Match::Mismatch => Vec::new(),
-            Match::NullPrefix => vec![(0, self.children.iter())],
-            Match::Full(len) => vec![(len as usize, self.children.iter())],
-        };
-        Iter { prefix, iters }
+    /// Iterates over the values present in the trie.
+    pub fn values(&self) -> Values<T> {
+        self.into()
+    }
+    /// Iterates mutably over the values present in the trie.
+    pub fn values_mut(&mut self) -> ValuesMut<T> {
+        self.into()
+    }
+    /// Iterates over the key-value pairs present in the trie.
+    ///
+    /// The key part of the item only lives as long as [`Iterator::next`] isn't called.
+    pub fn iter(&self) -> Iter<T> {
+        self.into_iter()
+    }
+    /// Iterates mutably over the key-value pairs present in the trie.
+    ///
+    /// The key part of the item only lives as long as [`Iterator::next`] isn't called.
+    pub fn iter_mut(&mut self) -> IterMut<T> {
+        self.into_iter()
+    }
+    /// Returns the number of entries marked as deleted within the trie.
+    pub fn count_gravestones(&self) -> usize {
+        self.children.iter().fold(
+            (self.inner.tag == TrieInner::<T>::DELETED) as usize,
+            |acc, it| acc + it.count_gravestones(),
+        )
     }
 }
-pub struct Iter<'a, T> {
-    prefix: &'a [u8],
-    iters: Vec<(usize, std::slice::Iter<'a, Trie<T>>)>,
+pub struct Values<'a, T> {
+    iters: Vec<std::slice::Iter<'a, Trie<T>>>,
 }
-impl<'a, T> IntoIterator for &'a Trie<T> {
-    type Item = &'a T;
-    type IntoIter = Iter<'a, T>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter(b"/")
+impl<'a, T> From<&'a Trie<T>> for Values<'a, T> {
+    fn from(trie: &'a Trie<T>) -> Self {
+        Values {
+            iters: vec![trie.children.iter()],
+        }
     }
 }
-impl<'a, T> Iterator for Iter<'a, T> {
+impl<'a, T> Iterator for Values<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let (start, iter) = self.iters.last_mut()?;
-            let start = *start;
-            let prefix = &self.prefix[start..];
+            let iter = self.iters.last_mut()?;
             if let Some(node) = iter.next() {
-                match node.inner.match_bytes(prefix) {
-                    Match::NullPrefix => self.iters.push((start, node.children.iter())),
-                    Match::Full(len) => self
-                        .iters
-                        .push((start + len as usize, node.children.iter())),
-                    Match::Leaf if self.prefix.len() == start => return Some(node.inner.as_ref()),
-                    Match::Partial(len) if self.prefix.len() == start + len as usize => self
-                        .iters
-                        .push((start + len as usize, node.children.iter())),
-                    _ => {}
+                match node.inner.tag {
+                    TrieInner::<T>::DELETED => {}
+                    TrieInner::<T>::LEAF => return Some(node.inner.as_ref()),
+                    _ => self.iters.push(node.children.iter()),
                 }
             } else {
                 self.iters.pop();
+            }
+        }
+    }
+}
+pub struct ValuesMut<'a, T> {
+    iters: Vec<std::slice::IterMut<'a, Trie<T>>>,
+}
+impl<'a, T> From<&'a mut Trie<T>> for ValuesMut<'a, T> {
+    fn from(trie: &'a mut Trie<T>) -> Self {
+        ValuesMut {
+            iters: vec![trie.children.iter_mut()],
+        }
+    }
+}
+impl<'a, T> Iterator for ValuesMut<'a, T> {
+    type Item = &'a mut T;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let iter = self.iters.last_mut()?;
+            if let Some(node) = iter.next() {
+                match node.inner.tag {
+                    TrieInner::<T>::DELETED => {}
+                    TrieInner::<T>::LEAF => return Some(node.inner.as_mut()),
+                    _ => self.iters.push(node.children.iter_mut()),
+                }
+            } else {
+                self.iters.pop();
+            }
+        }
+    }
+}
+pub struct Iter<'a, T> {
+    key: Vec<u8>,
+    iters: Vec<(usize, std::slice::Iter<'a, Trie<T>>)>,
+}
+impl<'a, T> IntoIterator for &'a Trie<T> {
+    type Item = (&'a [u8], &'a T);
+    type IntoIter = Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        let key = self.inner.as_bytes();
+        Iter {
+            key: key.into(),
+            iters: vec![(0, self.children.iter())],
+        }
+    }
+}
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = (&'a [u8], &'a T);
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (_, iter) = self.iters.last_mut()?;
+            if let Some(node) = iter.next() {
+                match node.inner.tag {
+                    TrieInner::<T>::DELETED => {}
+                    TrieInner::<T>::LEAF => {
+                        return Some((
+                            unsafe {
+                                std::slice::from_raw_parts(self.key.as_ptr(), self.key.len())
+                            },
+                            node.inner.as_ref(),
+                        ))
+                    }
+                    _ => {
+                        let new_len = self.key.len();
+                        self.key.extend(node.inner.as_bytes());
+                        self.iters.push((new_len, node.children.iter()))
+                    }
+                }
+            } else if let Some((len, _)) = self.iters.pop() {
+                unsafe { self.key.set_len(len) }
+            }
+        }
+    }
+}
+pub struct IterMut<'a, T> {
+    key: Vec<u8>,
+    iters: Vec<(usize, std::slice::IterMut<'a, Trie<T>>)>,
+}
+impl<'a, T> IntoIterator for &'a mut Trie<T> {
+    type Item = (&'a [u8], &'a mut T);
+    type IntoIter = IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        let key = self.inner.as_bytes();
+        IterMut {
+            key: key.into(),
+            iters: vec![(0, self.children.iter_mut())],
+        }
+    }
+}
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = (&'a [u8], &'a mut T);
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (_, iter) = self.iters.last_mut()?;
+            if let Some(node) = iter.next() {
+                match node.inner.tag {
+                    TrieInner::<T>::DELETED => {}
+                    TrieInner::<T>::LEAF => {
+                        return Some((
+                            unsafe {
+                                std::slice::from_raw_parts(self.key.as_ptr(), self.key.len())
+                            },
+                            node.inner.as_mut(),
+                        ))
+                    }
+                    _ => {
+                        let new_len = self.key.len();
+                        self.key.extend(node.inner.as_bytes());
+                        self.iters.push((new_len, node.children.iter_mut()))
+                    }
+                }
+            } else if let Some((len, _)) = self.iters.pop() {
+                unsafe { self.key.set_len(len) }
             }
         }
     }
@@ -224,27 +449,6 @@ impl<T: Sized + std::fmt::Debug> std::fmt::Display for Trie<T> {
                 }
             }
         }
-    }
-}
-#[test]
-fn trie_display() {
-    let mut trie: Trie<String> = Trie::new();
-    let paths: [&str; 5] = [
-        "/panda",
-        "/patate/douce",
-        "/patate",
-        "/panda/geant",
-        "/panda/roux",
-    ];
-    for path in paths {
-        trie.insert(path, path.to_uppercase());
-        println!("{}", &trie);
-    }
-    for path in paths {
-        println!("{}", trie.get(dbg!(path)).unwrap());
-    }
-    for value in trie.iter(b"/pan") {
-        dbg!(value);
     }
 }
 impl<T: Sized> From<TrieInner<T>> for Trie<T> {
@@ -447,6 +651,15 @@ impl<T> TrieInner<T> {
         self.take()
             .expect("Attempted to apply into_inner on a non-leaf node")
     }
+    fn as_bytes(&self) -> &[u8] {
+        match self.tag {
+            Self::DELETED | Self::LEAF => b"",
+            Self::SLASH => b"/",
+            Self::STAR => b"*/",
+            Self::DOUBLE_STAR => b"**/",
+            tag => &self.inner.bytes[..tag as usize],
+        }
+    }
 }
 impl<T> AsRef<T> for TrieInner<T> {
     fn as_ref(&self) -> &T {
@@ -479,4 +692,35 @@ fn trie_check_size() {
     assert_eq!(std::mem::size_of_val(&trie), 64);
     let trie: Trie<[u8; 4]> = Trie::new();
     assert_eq!(std::mem::size_of_val(&trie), 64);
+}
+
+#[test]
+fn trie_general() {
+    let mut trie: Trie<String> = Trie::new();
+    let keys: [&str; 5] = [
+        "/panda",
+        "/patate/douce",
+        "/patate",
+        "/panda/geant",
+        "/panda/roux",
+    ];
+    for key in keys {
+        assert!(trie.insert(key, key.to_uppercase()).is_none());
+    }
+    for (key, value) in &trie {
+        let key = std::str::from_utf8(key).unwrap();
+        assert!(keys.contains(&key));
+        assert_eq!(&key.to_uppercase(), value);
+    }
+    for key in keys {
+        assert_eq!(trie.get(key).unwrap(), &key.to_uppercase());
+    }
+    for key in keys.iter().filter(|p| !p.starts_with("/panda")) {
+        assert_eq!(trie.remove(key).unwrap(), key.to_uppercase());
+    }
+    assert_eq!(trie.count_gravestones(), 2);
+    trie.prune();
+    assert_eq!(trie.count_gravestones(), 0);
+    trie.insert("/panda", "PANDA".into()).unwrap();
+    assert_eq!(trie.get("/panda").unwrap(), "PANDA");
 }
