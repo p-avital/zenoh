@@ -79,6 +79,9 @@ impl<T> Trie<T> {
     }
     /// Returns `true` if a value exists for `key`. If `GREEDY == false`, will only return `true` if an exact match exist (wildcards are treated as litteral strings).
     pub fn contains<P: AsRef<[u8]>, const GREEDY: bool>(&self, key: P) -> bool {
+        if GREEDY {
+            return self.get_all(key).next().is_some();
+        }
         let key = key.as_ref();
         match self.inner.match_bytes(key) {
             Match::Leaf => true,
@@ -94,13 +97,7 @@ impl<T> Trie<T> {
             | Match::NullPrefix
             | Match::Partial(_)
             | Match::Star { .. }
-            | Match::DouleStar { .. } => {
-                if GREEDY {
-                    todo!("greedy matching not implemented yet")
-                } else {
-                    false
-                }
-            }
+            | Match::DouleStar { .. } => false,
         }
     }
     /// Returns a reference to the matching item if the `key` mathes exactly (wildcards are treaded as litteral strings).
@@ -121,6 +118,12 @@ impl<T> Trie<T> {
             | Match::DouleStar { .. } => None,
         }
     }
+    /// Returns an iterator over the key-value pairs that match the provided `key`.
+    ///
+    /// The iterated keys are only valid until the next call to [`Iterator::next`], but the value references are valid throughout `'a`.
+    pub fn get_all<P: AsRef<[u8]>>(&self, _key: P) -> GreedyIter<T> {
+        todo!()
+    }
     /// Returns a mutable reference to the matching item if the `key` mathes exactly (wildcards are treaded as litteral strings).
     pub fn get_mut<P: AsRef<[u8]>>(&mut self, key: P) -> Option<&mut T> {
         let key = key.as_ref();
@@ -138,6 +141,12 @@ impl<T> Trie<T> {
             | Match::Star { .. }
             | Match::DouleStar { .. } => None,
         }
+    }
+    /// Returns a mutable iterator over the key-value pairs that match the provided `key`.
+    ///
+    /// The iterated keys are only valid until the next call to [`Iterator::next`], but the mutable value references are valid throughout `'a`.
+    pub fn get_all_mut<P: AsRef<[u8]>>(&mut self, _key: P) -> GreedyIterMut<T> {
+        todo!()
     }
     /// Removes an entry, setting a gravestone in its place, using exact matching (wildcards are treaded as litteral strings).
     ///
@@ -161,6 +170,17 @@ impl<T> Trie<T> {
             | Match::Star { .. }
             | Match::DouleStar { .. } => None,
         }
+    }
+    /// __Lazily__ removes all entries matching the provided keys.
+    ///
+    /// The iterator will yield each removed value. Upon dropping, the rest of the iterator will be iterated upon to ensure complete removal.
+    /// This remover doesn't do any pruning of the trie. A good use pattern could be
+    /// ```rust
+    /// # let mut trie = Trie::new();
+    /// if trie.remove_all("/demo/keys/**").count() > 10 {trie.prune()}
+    /// ```
+    pub fn remove_all<P: AsRef<[u8]>>(&mut self, _key: P) -> GreedyRemover<T> {
+        todo!()
     }
     /// Removes an entry and applies local pruning to reoptimize the trie, using exact matching (wildcards are treaded as litteral strings).
     ///
@@ -420,6 +440,39 @@ impl<'a, T> Iterator for IterMut<'a, T> {
                 unsafe { self.key.set_len(len) }
             }
         }
+    }
+}
+
+pub struct GreedyIter<'a, T> {
+    todo: std::marker::PhantomData<&'a T>,
+}
+impl<'a, T> Iterator for GreedyIter<'a, T> {
+    type Item = (&'a [u8], &'a T);
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+pub struct GreedyIterMut<'a, T> {
+    todo: std::marker::PhantomData<&'a T>,
+}
+impl<'a, T> Iterator for GreedyIterMut<'a, T> {
+    type Item = (&'a [u8], &'a mut T);
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+pub struct GreedyRemover<'a, T> {
+    todo: std::marker::PhantomData<&'a T>,
+}
+impl<'a, T> Iterator for GreedyRemover<'a, T> {
+    type Item = (&'a [u8], T);
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+impl<'a, T> Drop for GreedyRemover<'a, T> {
+    fn drop(&mut self) {
+        for _ in self {}
     }
 }
 
