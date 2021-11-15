@@ -1,4 +1,6 @@
-use std::fmt::Write;
+use std::{fmt::Write, iter::FromIterator};
+
+use aes::cipher::generic_array::functional::FunctionalSequence;
 
 pub struct Trie<T> {
     inner: TrieInner<T>,
@@ -26,46 +28,86 @@ impl<T> Trie<T> {
         }
     }
     /// Inserts a value at the provided key, returning the previously stored value if it existed (wildcards are treated as litteral strings).
-    pub fn insert<P: AsRef<[u8]>>(&mut self, key: P, value: T) -> Option<T> {
-        let key = key.as_ref();
-        match self.inner.match_bytes(key) {
-            Match::Full(n) => self.do_insert(&key[n as usize..], value),
-            _ => None,
+    pub fn insert<P: AsRef<[u8]>>(&mut self, key: P, mut value: T) -> Option<T> {
+        let mut current = self;
+        let mut key = KeyTokenizer::new(&key);
+        if current.inner.insert_match(key.next()?) != InsertionMatch::Full {
+            return None;
         }
-    }
-    fn do_insert(&mut self, key: &[u8], mut value: T) -> Option<T> {
-        for child in &mut self.children {
-            match child.inner.match_bytes(key) {
-                Match::Partial(len) => {
-                    child.split(len);
-                    return child.do_insert(&key[len as usize..], value);
+        let mut current_token = key.next();
+        while let Some(mut token) = current_token {
+            let mut next_current = None;
+            for child in &mut current.children {
+                match child.inner.insert_match(token) {
+                    InsertionMatch::Mismatch => {}
+                    InsertionMatch::Full => {
+                        current_token = key.next();
+                        next_current = Some(unsafe { &mut *(child as *mut _) });
+                        break;
+                    }
+                    InsertionMatch::SplitNode(at) => child.split(at),
+                    InsertionMatch::SplitToken(0) => todo!(),
+                    InsertionMatch::SplitToken(at) => unsafe {
+                        // safety: `at` is guaranteed non-zero and strictly smaller than the current len of token.
+                        current_token = Some(token.split_unchecked(at));
+                        next_current = Some(&mut *(child as *mut _));
+                        break;
+                    },
+                    InsertionMatch::SplitBoth(at) => {
+                        child.split(at);
+                        unsafe {
+                            // safety: `at` is guaranteed non-zero and strictly smaller than the current len of token.
+                            current_token = Some(token.split_unchecked(at));
+                            next_current = Some(&mut *(child as *mut _));
+                        }
+                        break;
+                    }
                 }
-                Match::Leaf => {
-                    std::mem::swap(&mut value, child.inner.as_mut());
-                    return Some(value);
+            }
+            if let Some(next_current) = next_current {
+                current = next_current
+            } else {
+                let (inner, mut rest) = (&token).into();
+                let child = Trie {
+                    inner,
+                    children: Vec::with_capacity(1),
+                };
+                current.children.push(child);
+                current = current
+                    .children
+                    .last_mut()
+                    .unwrap_or_else(|| unsafe { std::hint::unreachable_unchecked() });
+                while !rest.is_empty() {
+                    let (inner, new_rest) = TrieInner::from_bytes(rest);
+                    rest = new_rest;
+                    let child = Trie {
+                        inner,
+                        children: Vec::with_capacity(1),
+                    };
+                    current.children.push(child);
+                    current = current
+                        .children
+                        .last_mut()
+                        .unwrap_or_else(|| unsafe { std::hint::unreachable_unchecked() });
                 }
-                Match::Full(len)
-                | Match::Star { exact: true, len }
-                | Match::DouleStar { exact: true, len } => {
-                    return child.do_insert(&key[len as usize..], value)
-                }
-                _ => continue,
+                current_token = key.next();
             }
         }
-        let mut children = &mut self.children;
-        let mut key = key;
-        while !key.is_empty() {
-            let (inner, p) = TrieInner::from_bytes(key);
-            let child = Trie {
-                inner,
-                children: Vec::with_capacity(1),
-            };
-            children.push(child);
-            key = p;
-            children = &mut children.last_mut().unwrap().children;
+        if let Some(child) = current.children.iter_mut().find(|child| {
+            child.inner.tag == TrieInner::<T>::LEAF || child.inner.tag == TrieInner::<T>::DELETED
+        }) {
+            if child.inner.tag == TrieInner::<T>::DELETED {
+                unsafe { std::ptr::write(child.inner.as_mut(), value) };
+                child.inner.tag = TrieInner::<T>::LEAF;
+                None
+            } else {
+                std::mem::swap(child.inner.as_mut(), &mut value);
+                Some(value)
+            }
+        } else {
+            current.children.push(TrieInner::leaf(value).into());
+            None
         }
-        children.push(TrieInner::leaf(value).into());
-        None
     }
     fn split(&mut self, at: u32) {
         let previous_length = self.inner.tag as usize;
@@ -83,7 +125,7 @@ impl<T> Trie<T> {
             return self.get_all(key).next().is_some();
         }
         let key = key.as_ref();
-        match self.inner.match_bytes(key) {
+        match self.inner.match_bytes::<false>(key) {
             Match::Leaf => true,
             Match::Full(len)
             | Match::Star { exact: true, len }
@@ -103,7 +145,7 @@ impl<T> Trie<T> {
     /// Returns a reference to the matching item if the `key` mathes exactly (wildcards are treaded as litteral strings).
     pub fn get<P: AsRef<[u8]>>(&self, key: P) -> Option<&T> {
         let key = key.as_ref();
-        match self.inner.match_bytes(key) {
+        match self.inner.match_bytes::<false>(key) {
             Match::Leaf => Some(self.inner.as_ref()),
             Match::Full(len)
             | Match::Star { exact: true, len }
@@ -127,7 +169,7 @@ impl<T> Trie<T> {
     /// Returns a mutable reference to the matching item if the `key` mathes exactly (wildcards are treaded as litteral strings).
     pub fn get_mut<P: AsRef<[u8]>>(&mut self, key: P) -> Option<&mut T> {
         let key = key.as_ref();
-        match self.inner.match_bytes(key) {
+        match self.inner.match_bytes::<false>(key) {
             Match::Leaf => Some(self.inner.as_mut()),
             Match::Full(len)
             | Match::Star { exact: true, len }
@@ -153,7 +195,7 @@ impl<T> Trie<T> {
     /// This remove is faster than [`Self::clean_remove`], but requires global cleanup steps to be taken in the future, such as [`Self::prune`]-ing after a few removes.
     pub fn remove<P: AsRef<[u8]>>(&mut self, key: P) -> Option<T> {
         let key = key.as_ref();
-        match self.inner.match_bytes(key) {
+        match self.inner.match_bytes::<false>(key) {
             Match::Leaf => {
                 self.inner.tag = TrieInner::<T>::DELETED;
                 Some(unsafe { std::ptr::read(std::mem::transmute(&mut self.inner.inner.bytes)) })
@@ -176,6 +218,7 @@ impl<T> Trie<T> {
     /// The iterator will yield each removed value. Upon dropping, the rest of the iterator will be iterated upon to ensure complete removal.
     /// This remover doesn't do any pruning of the trie. A good use pattern could be
     /// ```rust
+    /// # use zenoh_util::collections::tries::Trie
     /// # let mut trie = Trie::new();
     /// if trie.remove_all("/demo/keys/**").count() > 10 {trie.prune()}
     /// ```
@@ -189,7 +232,7 @@ impl<T> Trie<T> {
         self.do_clean_remove(key.as_ref()).map(|f| f.0)
     }
     fn do_clean_remove(&mut self, key: &[u8]) -> Option<(T, bool)> {
-        match self.inner.match_bytes(key) {
+        match self.inner.match_bytes::<false>(key) {
             Match::Leaf => {
                 self.inner.tag = TrieInner::<T>::DELETED;
                 Some((
@@ -443,36 +486,251 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     }
 }
 
+struct NoDoublestarIter<'a, T> {
+    requested_key: &'a [u8],
+    current_key: Vec<u8>,
+    iters: Vec<(usize, usize, std::slice::Iter<'a, Trie<T>>)>,
+}
+
+enum GreedyIterEnum<'a, T> {
+    NoDoublestar(NoDoublestarIter<'a, T>),
+}
+
 pub struct GreedyIter<'a, T> {
-    todo: std::marker::PhantomData<&'a T>,
+    inner: GreedyIterEnum<'a, T>,
 }
 impl<'a, T> Iterator for GreedyIter<'a, T> {
     type Item = (&'a [u8], &'a T);
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {}
+    }
+}
+struct GreedyMutator<'a, T> {
+    todo: std::marker::PhantomData<&'a T>,
+}
+impl<'a, T> Iterator for GreedyMutator<'a, T> {
+    type Item = (&'a [u8], &'a mut Trie<T>);
     fn next(&mut self) -> Option<Self::Item> {
         todo!()
     }
 }
 pub struct GreedyIterMut<'a, T> {
-    todo: std::marker::PhantomData<&'a T>,
+    mutator: GreedyMutator<'a, T>,
 }
 impl<'a, T> Iterator for GreedyIterMut<'a, T> {
     type Item = (&'a [u8], &'a mut T);
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.mutator
+            .next()
+            .map(|(key, trie)| (key, trie.inner.as_mut()))
     }
 }
 pub struct GreedyRemover<'a, T> {
-    todo: std::marker::PhantomData<&'a T>,
+    mutator: GreedyMutator<'a, T>,
 }
 impl<'a, T> Iterator for GreedyRemover<'a, T> {
     type Item = (&'a [u8], T);
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        for (key, trie) in &mut self.mutator {
+            if let Some(value) = trie.inner.take() {
+                return Some((key, value));
+            }
+        }
+        None
     }
 }
 impl<'a, T> Drop for GreedyRemover<'a, T> {
     fn drop(&mut self) {
         for _ in self {}
+    }
+}
+
+struct KeyTokenizer<'a> {
+    key: &'a [u8],
+    index: usize,
+}
+impl<'a> KeyTokenizer<'a> {
+    fn new<S: AsRef<[u8]> + ?Sized>(key: &'a S) -> Self {
+        KeyTokenizer {
+            key: key.as_ref(),
+            index: 0,
+        }
+    }
+    fn token(key: &'a [u8], at: usize) -> (Option<Token<'a>>, usize) {
+        let mut tokenizer = KeyTokenizer { key, index: at };
+        let token = tokenizer.next();
+        (token, tokenizer.index)
+    }
+    fn reset(&mut self) {
+        self.index = 0
+    }
+    fn seek_end(&mut self) {
+        self.index = self.key.len()
+    }
+}
+impl<'a> Iterator for KeyTokenizer<'a> {
+    type Item = Token<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let key = &self.key[self.index..];
+        if key.is_empty() {
+            return None;
+        }
+        match (key[0], key.get(1)) {
+            (b'/', _) => {
+                self.index += 1;
+                Some(Token::SLASH)
+            }
+            (b'*', None) => {
+                self.index += 1;
+                Some(Token::STAR)
+            }
+            (b'*', Some(b'/')) => {
+                self.index += 2;
+                Some(Token::STAR)
+            }
+            (b'*', Some(b'*')) => match key.get(2) {
+                None => {
+                    self.index += 2;
+                    Some(Token::DOUBLE_STAR)
+                }
+                Some(b'/') => {
+                    self.index += 3;
+                    Some(Token::DOUBLE_STAR)
+                }
+                _ => {
+                    if let Some(next_slash) = key.iter().position(|c| *c == b'/') {
+                        self.index += next_slash;
+                        Some(Token::from(&key[..next_slash]))
+                    } else {
+                        self.index = self.key.len();
+                        Some(key.into())
+                    }
+                }
+            },
+            _ => {
+                if let Some(next_slash) = key.iter().position(|c| *c == b'/') {
+                    self.index += next_slash;
+                    Some(Token::from(&key[..next_slash]))
+                } else {
+                    self.index = self.key.len();
+                    Some(key.into())
+                }
+            }
+        }
+    }
+}
+impl<'a> DoubleEndedIterator for KeyTokenizer<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.index == 0 {
+            return None;
+        }
+        match (
+            self.key[self.index - 1],
+            (self.index >= 2).then(|| self.key[self.index - 2]),
+        ) {
+            (b'*', Some(b'/')) | (b'*', None) => {
+                self.index -= 1;
+                Some(Token::STAR)
+            }
+            (b'*', Some(b'*')) if self.index == 2 || self.key[self.index - 3] == b'/' => {
+                self.index -= 2;
+                Some(Token::DOUBLE_STAR)
+            }
+            (b'/', Some(b'*')) if self.index == 2 || self.key[self.index - 3] == b'/' => {
+                self.index -= 2;
+                Some(Token::STAR)
+            }
+            (b'/', Some(b'*'))
+                if (self.index == 3 && self.key[self.index - 3] == b'*')
+                    || (self.index > 3
+                        && self.key[self.index - 3] == b'*'
+                        && self.key[self.index - 4] == b'/') =>
+            {
+                self.index -= 3;
+                Some(Token::DOUBLE_STAR)
+            }
+            (b'/', _) => {
+                self.index -= 1;
+                Some(Token::SLASH)
+            }
+            _ => {
+                let end = self.index;
+                for start in (0..end - 1).rev() {
+                    if self.key[start] == b'/' {
+                        self.index = start + 1;
+                        return Some(Token::from(&self.key[self.index..end]));
+                    }
+                }
+                self.index = 0;
+                Some(Token::from(&self.key[..end]))
+            }
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Token<'a> {
+    start: *const u8,
+    len: std::num::NonZeroUsize,
+    lifetime: std::marker::PhantomData<&'a ()>,
+}
+impl<'a> std::fmt::Display for Token<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::DOUBLE_STAR => f.write_str("**/"),
+            Self::STAR => f.write_str("*/"),
+            Self::SLASH => f.write_str("/"),
+            slice => f.write_str(std::str::from_utf8(slice.into()).unwrap()),
+        }
+    }
+}
+impl<'a> From<&'a [u8]> for Token<'a> {
+    fn from(slice: &'a [u8]) -> Self {
+        let start = slice.as_ptr();
+        Token {
+            start,
+            len: std::num::NonZeroUsize::new(slice.len()).unwrap(),
+            lifetime: std::marker::PhantomData,
+        }
+    }
+}
+impl<'a> From<Token<'a>> for &'a [u8] {
+    fn from(slice: Token<'a>) -> Self {
+        unsafe { std::slice::from_raw_parts(slice.start, slice.len.get()) }
+    }
+}
+impl<'a> Token<'a> {
+    const DOUBLE_STAR: Self = Token {
+        start: std::ptr::null(),
+        len: unsafe { std::num::NonZeroUsize::new_unchecked(3) },
+        lifetime: std::marker::PhantomData,
+    };
+    const STAR: Self = Token {
+        start: std::ptr::null(),
+        len: unsafe { std::num::NonZeroUsize::new_unchecked(1) },
+        lifetime: std::marker::PhantomData,
+    };
+    const SLASH: Self = Token {
+        start: std::ptr::null(),
+        len: unsafe { std::num::NonZeroUsize::new_unchecked(2) },
+        lifetime: std::marker::PhantomData,
+    };
+    fn is_str(&self) -> bool {
+        !self.start.is_null()
+    }
+    fn as_bytes(&'a self) -> &'a [u8] {
+        unsafe { std::slice::from_raw_parts(self.start, self.len.get()) }
+    }
+    /// Splits a string token into 2 string tokens.
+    /// # Safety
+    /// This method performs no bounds checks, as requests to split a token only originate from contexts where bound checks have already been made
+    unsafe fn split_unchecked(&mut self, at: u32) -> Self {
+        let result = Token {
+            start: self.start.offset(at as isize),
+            len: std::num::NonZeroUsize::new_unchecked(self.len.get() - at as usize),
+            lifetime: self.lifetime,
+        };
+        self.len = std::num::NonZeroUsize::new_unchecked(at as usize);
+        result
     }
 }
 
@@ -573,6 +831,14 @@ enum Match {
     DouleStar { exact: bool, len: u32 },
 }
 const INNER_SIZE: usize = 64 - std::mem::size_of::<Vec<Trie<()>>>() - std::mem::size_of::<u8>();
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InsertionMatch {
+    Mismatch,
+    Full,
+    SplitNode(u32),
+    SplitToken(u32),
+    SplitBoth(u32),
+}
 impl<T> TrieInner<T> {
     fn from_bytes(s: &[u8]) -> (Self, &[u8]) {
         if s.starts_with(b"/") {
@@ -597,7 +863,42 @@ impl<T> TrieInner<T> {
         result.inner.bytes[..split].clone_from_slice(left);
         (result, right)
     }
-    fn match_bytes(&self, rhs: &[u8]) -> Match {
+    fn insert_match(&self, rhs: Token) -> InsertionMatch {
+        if self.tag == 0 {
+            return InsertionMatch::SplitToken(0);
+        }
+        if rhs.is_str() {
+            return self.insert_match_bytes(rhs.as_bytes());
+        }
+        match (self.tag, rhs) {
+            (Self::SLASH, Token::SLASH)
+            | (Self::STAR, Token::STAR)
+            | (Self::DOUBLE_STAR, Token::DOUBLE_STAR) => InsertionMatch::Full,
+            _ => InsertionMatch::Mismatch,
+        }
+    }
+    fn insert_match_bytes(&self, rhs: &[u8]) -> InsertionMatch {
+        if !self.is_str() {
+            return InsertionMatch::Mismatch;
+        }
+        let lhs = self.as_bytes();
+        if lhs[0] != rhs[0] {
+            return InsertionMatch::Mismatch;
+        }
+        let llen = lhs.len();
+        let rlen = rhs.len();
+        for i in 1..(llen.min(rlen)) {
+            if lhs[i] != rhs[i] {
+                return InsertionMatch::SplitBoth(i as u32);
+            }
+        }
+        match llen.cmp(&rlen) {
+            std::cmp::Ordering::Less => InsertionMatch::SplitNode(llen as u32),
+            std::cmp::Ordering::Equal => InsertionMatch::Full,
+            std::cmp::Ordering::Greater => InsertionMatch::SplitToken(rlen as u32),
+        }
+    }
+    fn match_bytes<const ALLOW_PARTIAL: bool>(&self, rhs: &[u8]) -> Match {
         if rhs.is_empty() {
             return if self.tag == Self::LEAF {
                 Match::Leaf
@@ -645,7 +946,7 @@ impl<T> TrieInner<T> {
                     }
                 }
             }
-            length if self.inner.bytes[0] == rhs[0] => {
+            length if ALLOW_PARTIAL && self.inner.bytes[0] == rhs[0] => {
                 for (i, (a, b)) in self.inner.bytes[1..length as usize]
                     .iter()
                     .zip(&rhs[1..])
@@ -656,6 +957,9 @@ impl<T> TrieInner<T> {
                     }
                 }
                 Match::Full((length as u32).min(rhs.len() as u32))
+            }
+            length if !ALLOW_PARTIAL && rhs.starts_with(&self.inner.bytes[..length as usize]) => {
+                Match::Full(length as u32)
             }
             _ => Match::Mismatch,
         }
@@ -700,10 +1004,6 @@ impl<T> TrieInner<T> {
             None
         }
     }
-    fn into_inner(mut self) -> T {
-        self.take()
-            .expect("Attempted to apply into_inner on a non-leaf node")
-    }
     fn as_bytes(&self) -> &[u8] {
         match self.tag {
             Self::DELETED | Self::LEAF => b"",
@@ -729,7 +1029,16 @@ impl<T> Drop for TrieInner<T> {
         std::mem::drop(self.take());
     }
 }
-
+impl<'a, T> From<&'a Token<'a>> for (TrieInner<T>, &'a [u8]) {
+    fn from(token: &'a Token<'a>) -> Self {
+        match *token {
+            Token::SLASH => (TrieInner::<T>::slash(), b""),
+            Token::STAR => (TrieInner::<T>::star(), b""),
+            Token::DOUBLE_STAR => (TrieInner::<T>::double_star(), b""),
+            _ => TrieInner::<T>::from_bytes(token.as_bytes()),
+        }
+    }
+}
 /// Ensures that Trie<T> construction panics if T is too large for Trie<T> to keep fitting.
 #[test]
 #[should_panic]
@@ -745,6 +1054,25 @@ fn trie_check_size() {
     assert_eq!(std::mem::size_of_val(&trie), 64);
     let trie: Trie<[u8; 4]> = Trie::new();
     assert_eq!(std::mem::size_of_val(&trie), 64);
+}
+
+#[test]
+fn trie_tokenizer() {
+    for key in [
+        "/panda",
+        "/patate/douce",
+        "/patate",
+        "/panda/geant",
+        "/panda/*",
+        "/**/*/roux",
+        "/panda/roux",
+    ] {
+        let mut tokenizer = KeyTokenizer::new(key);
+        let tokens = Vec::from_iter(tokenizer.by_ref());
+        for (a, b) in tokens.into_iter().rev().zip(tokenizer.rev()) {
+            assert_eq!(a, b)
+        }
+    }
 }
 
 #[test]
