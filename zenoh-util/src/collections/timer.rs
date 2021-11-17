@@ -277,7 +277,7 @@ mod tests {
             }
         }
 
-        async fn run() {
+        async fn test_run() {
             // Create the timer
             let mut timer = Timer::new();
 
@@ -396,6 +396,6 @@ mod tests {
             assert_eq!(value, amount);
         }
 
-        task::block_on(run());
+        task::block_on(test_run());
     }
 }

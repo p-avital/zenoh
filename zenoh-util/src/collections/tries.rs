@@ -1,30 +1,58 @@
-use std::{mem::MaybeUninit, ops::Add};
+use std::{hint::unreachable_unchecked, mem::MaybeUninit};
 
-pub type Trie<T, const N: usize> = GenericTrie<T, DefaultTokenizerBuilder, { N }>;
-
+pub type Trie<T, const N: usize> = GenericTrie<T, DefaultMatcher, { N }>;
+#[repr(C)]
 pub struct GenericTrie<T, Tokenizer, const N: usize> {
+    children: Vec<Self>,
     value: MaybeUninit<T>,
     buffer: [u8; N],
     tag: u8,
-    children: Vec<Self>,
     tokenizer_marker: std::marker::PhantomData<Tokenizer>,
 }
-macro_rules! static_assert_eqsize {
-    ($a: expr, $b: ty) => {
-        || -> $b { unsafe { std::mem::transmute($a) } };
-    };
-    ($a: ty, $b: ty) => {
-        static_assert_eqsize!(std::mem::MaybeUninit::<$a>::uninit(), $b)
-    };
+impl<T: std::fmt::Debug, Matcher, const N: usize> std::fmt::Debug
+    for GenericTrie<T, Matcher, { N }>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut formatter = f.debug_struct("GenericTrie");
+        let slice = self.as_ref();
+        if let Ok(s) = std::str::from_utf8(slice) {
+            formatter.field("prefix", &s);
+        } else {
+            formatter.field("buffer", &self.as_ref());
+        }
+        if let Some(value) = self.get_value() {
+            formatter.field("value", value);
+        }
+        if !self.children.is_empty() {
+            formatter.field("children", &self.children);
+        }
+        formatter.finish()
+    }
+}
+
+fn trim_slashes(key: &[u8]) -> &[u8] {
+    let isnt_slash = |&c| c != b'/';
+    let end = key.iter().rposition(isnt_slash).unwrap_or(0);
+    &key[..(end + 1)]
+}
+
+fn dbg(key: &[u8]) -> &[u8] {
+    println!("{}", std::str::from_utf8(key).unwrap());
+    key
 }
 
 impl<T, Tokenizer, const N: usize> GenericTrie<T, Tokenizer, { N }> {
     pub fn with_capacity(capacity: usize) -> Self {
-        debug_assert!(std::mem::size_of::<Self>() <= 64);
+        debug_assert_eq!(std::mem::size_of::<Self>(), 64);
+        let buffer = unsafe {
+            let mut buffer: MaybeUninit<[u8; N]> = MaybeUninit::uninit();
+            buffer.assume_init_mut()[0] = b'/';
+            buffer.assume_init()
+        };
         GenericTrie {
             value: MaybeUninit::uninit(),
-            buffer: [0; N],
-            tag: Self::SEGMENT_END_MASK,
+            buffer,
+            tag: 1,
             children: Vec::with_capacity(capacity),
             tokenizer_marker: std::marker::PhantomData,
         }
@@ -32,44 +60,100 @@ impl<T, Tokenizer, const N: usize> GenericTrie<T, Tokenizer, { N }> {
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
-    pub fn insert<Key>(&mut self, key: Key, mut value: T) -> Option<T>
-    where
-        Tokenizer: for<'a> TokenizerBuilder<'a, Key>,
-    {
-        let mut tokenizer = Tokenizer::build(&key);
-        let mut node = self;
-        let mut current_token = tokenizer.next();
-        'token: while let Some(token) = current_token {
-            for child in node.children.iter_mut() {
-                match InsertionMatch::from(token, child.as_ref(), child.is_segment_end()) {
-                    InsertionMatch::None => {}
-                    InsertionMatch::Full => unsafe {
-                        node = std::mem::transmute(child);
-                        current_token = tokenizer.next();
-                        continue 'token;
-                    },
-                    InsertionMatch::SplitToken(at) => unsafe {
-                        node = std::mem::transmute(child);
-                        current_token = Some(&token[at as usize..]);
-                        continue 'token;
-                    },
-                    InsertionMatch::SplitNode(at) => unsafe {
-                        child.split(at as usize);
-                        node = std::mem::transmute(&mut child.children[0]);
-                        continue 'token;
-                    },
-                    InsertionMatch::SplitBoth(_) => todo!(),
-                };
+    pub fn insert<K: AsRef<[u8]>>(&mut self, key: K, value: T) -> Option<T> {
+        let mut key = trim_slashes(key.as_ref());
+        match InsertionMatch::from(key, self.as_ref()) {
+            InsertionMatch::None => self.split(0),
+            InsertionMatch::Full => return self.set_value(value),
+            InsertionMatch::SplitLeft(at) => key = &key[at as usize..],
+            InsertionMatch::SplitRight(at) => {
+                self.split(at as usize);
+                return self.set_value(value);
+            }
+            InsertionMatch::SplitBoth(at) => {
+                let at = at as usize;
+                self.split(at);
+                key = &key[at..]
             }
         }
-        if node.holds_value() {
-            std::mem::swap(&mut value, unsafe { node.value.assume_init_mut() });
-            Some(value)
-        } else {
-            node.value = MaybeUninit::new(value);
-            node.tag |= Self::HOLDS_VALUE_MASK;
-            None
+        let mut node = self;
+        'traversal: loop {
+            for child in node.children.iter_mut() {
+                match InsertionMatch::from(key, child.as_ref()) {
+                    InsertionMatch::None => {}
+                    InsertionMatch::Full => {
+                        key = b"";
+                        break 'traversal;
+                    }
+                    InsertionMatch::SplitLeft(at) => {
+                        key = &key[at as usize..];
+                        node = unsafe { std::mem::transmute(child) };
+                        continue 'traversal;
+                    }
+                    InsertionMatch::SplitRight(at) => {
+                        child.split(at as usize);
+                        node = unsafe { std::mem::transmute(child) };
+                        key = b"";
+                        break 'traversal;
+                    }
+                    InsertionMatch::SplitBoth(at) => {
+                        let at = at as usize;
+                        child.split(at);
+                        node = unsafe { std::mem::transmute(child) };
+                        key = &key[at..];
+                    }
+                }
+            }
+            break 'traversal;
         }
+        for key in key.chunks(N) {
+            let mut buffer = [0; N];
+            let len = key.len();
+            buffer[..len].copy_from_slice(key);
+            let child = GenericTrie {
+                value: MaybeUninit::uninit(),
+                buffer,
+                tag: len as u8,
+                children: Vec::new(),
+                tokenizer_marker: std::marker::PhantomData,
+            };
+            node.children.push(child);
+            node = node
+                .children
+                .last_mut()
+                .unwrap_or_else(|| unsafe { unreachable_unchecked() })
+        }
+        node.set_value(value)
+    }
+    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<&T> {
+        let mut key = trim_slashes(key.as_ref());
+        let mut node = self;
+        'traversal: while !key.is_empty() {
+            for child in node.children.iter() {
+                if key.starts_with(child.as_ref()) {
+                    node = child;
+                    key = &key[child.len() as usize..];
+                    continue 'traversal;
+                }
+            }
+            return None;
+        }
+        node.get_value()
+    }
+    pub fn get_mut<K: AsRef<[u8]>>(&mut self, key: K) -> Option<&mut T> {
+        let mut key = trim_slashes(key.as_ref());
+        let mut node = self;
+        'traversal: while !key.is_empty() {
+            for child in node.children.iter_mut() {
+                if key.starts_with(child.as_ref()) {
+                    key = &key[child.len() as usize..];
+                    node = unsafe { std::mem::transmute(child) };
+                    continue 'traversal;
+                }
+            }
+            return None;
+        }
+        node.get_value_mut()
     }
 }
 impl<T, Tokenizer, const N: usize> GenericTrie<T, Tokenizer, { N }> {
@@ -96,38 +180,82 @@ impl<T, Tokenizer, const N: usize> GenericTrie<T, Tokenizer, { N }> {
         self.children.push(child);
         self.tag = at as u8;
     }
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(self.as_ref()).unwrap()
+    }
+    const LEN_MASK: u8 = 0b0111_1111;
+    const HOLDS_VALUE_MASK: u8 = 0b1000_0000;
+    const fn holds_value(&self) -> bool {
+        self.tag & Self::HOLDS_VALUE_MASK != 0
+    }
+    const fn len(&self) -> u8 {
+        self.tag & Self::LEN_MASK
+    }
+    fn set_value(&mut self, mut value: T) -> Option<T> {
+        if self.holds_value() {
+            std::mem::swap(&mut value, unsafe { self.value.assume_init_mut() });
+            Some(value)
+        } else {
+            unsafe {
+                self.value = MaybeUninit::new(value);
+                self.set_holds_value(true);
+            }
+            None
+        }
+    }
+    fn remove_value(&mut self) -> Option<T> {
+        self.holds_value().then(|| unsafe {
+            self.set_holds_value(false);
+            std::ptr::read(self.value.as_ptr())
+        })
+    }
+    fn get_value(&self) -> Option<&T> {
+        self.holds_value()
+            .then(|| unsafe { std::mem::transmute(&self.value) })
+    }
+    fn get_value_mut(&mut self) -> Option<&mut T> {
+        self.holds_value()
+            .then(|| unsafe { std::mem::transmute(&mut self.value) })
+    }
+    unsafe fn set_holds_value(&mut self, value: bool) {
+        self.tag &= !Self::HOLDS_VALUE_MASK;
+        self.tag |= if value { Self::HOLDS_VALUE_MASK } else { 0 }
+    }
     fn set_len(&mut self, len: usize) {
-        self.tag &= 0b1100_0000;
-        self.tag |= len as u8 & 0b0011_1111
+        self.tag &= !Self::LEN_MASK;
+        self.tag |= len as u8 & Self::LEN_MASK
     }
 }
-
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum InsertionMatch {
     None,
     Full,
-    SplitToken(u32),
-    SplitNode(u32),
+    SplitLeft(u32),
+    SplitRight(u32),
     SplitBoth(u32),
 }
 impl InsertionMatch {
-    fn from(token: &[u8], node: &[u8], segment_end: bool) -> Self {
-        todo!()
-    }
-}
-pub trait TokenizerBuilder<'a, T> {
-    type Tokenizer: Iterator<Item = &'a [u8]>;
-    fn build(_: &'a T) -> Self::Tokenizer;
-}
-pub struct DefaultTokenizerBuilder {}
-impl<'a, T: 'a + AsRef<[u8]>> TokenizerBuilder<'a, T> for DefaultTokenizerBuilder {
-    type Tokenizer = DefaultTokenizer<'a>;
-    fn build(slice: &'a T) -> Self::Tokenizer {
-        DefaultTokenizer {
-            slice: slice.as_ref(),
-            index: 0,
+    fn from(left: &[u8], right: &[u8]) -> Self {
+        match (left.len(), right.len()) {
+            (0, 0) => Self::Full,
+            (_, _) if left[0] != right[0] => Self::None,
+            (llen, rlen) => {
+                for i in 1..llen.min(rlen) {
+                    if left[i] != right[i] {
+                        return Self::SplitBoth(i as u32);
+                    }
+                }
+                match llen.cmp(&rlen) {
+                    std::cmp::Ordering::Less => Self::SplitRight(llen as u32),
+                    std::cmp::Ordering::Equal => Self::Full,
+                    std::cmp::Ordering::Greater => Self::SplitLeft(rlen as u32),
+                }
+            }
         }
     }
 }
+
+pub struct DefaultMatcher;
 pub struct DefaultTokenizer<'a> {
     slice: &'a [u8],
     index: usize,
@@ -172,20 +300,6 @@ impl<'a> Iterator for DefaultTokenizer<'a> {
 impl<T, Tokenizer, const N: usize> Default for GenericTrie<T, Tokenizer, { N }> {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl<T, Tokenizer, const N: usize> GenericTrie<T, Tokenizer, { N }> {
-    const SEGMENT_END_MASK: u8 = 0b0100_0000;
-    const HOLDS_VALUE_MASK: u8 = 0b1000_0000;
-    const fn holds_value(&self) -> bool {
-        self.tag & Self::HOLDS_VALUE_MASK != 0
-    }
-    const fn is_segment_end(&self) -> bool {
-        self.tag & Self::SEGMENT_END_MASK != 0
-    }
-    const fn len(&self) -> u8 {
-        self.tag & 0b0011_1111
     }
 }
 
@@ -615,49 +729,44 @@ impl<T, Tokenizer, const N: usize> AsRef<[u8]> for GenericTrie<T, Tokenizer, { N
 //         }
 //     }
 // }
-// pub struct Iter<'a, T> {
-//     key: Vec<u8>,
-//     iters: Vec<(usize, std::slice::Iter<'a, Trie<T>>)>,
-// }
-// impl<'a, T> IntoIterator for &'a Trie<T> {
-//     type Item = (&'a [u8], &'a T);
-//     type IntoIter = Iter<'a, T>;
-//     fn into_iter(self) -> Self::IntoIter {
-//         let key = self.inner.as_bytes();
-//         Iter {
-//             key: key.into(),
-//             iters: vec![(0, self.children.iter())],
-//         }
-//     }
-// }
-// impl<'a, T> Iterator for Iter<'a, T> {
-//     type Item = (&'a [u8], &'a T);
-//     fn next(&mut self) -> Option<Self::Item> {
-//         loop {
-//             let (_, iter) = self.iters.last_mut()?;
-//             if let Some(node) = iter.next() {
-//                 match node.inner.tag {
-//                     TrieInner::<T>::DELETED => {}
-//                     TrieInner::<T>::LEAF => {
-//                         return Some((
-//                             unsafe {
-//                                 std::slice::from_raw_parts(self.key.as_ptr(), self.key.len())
-//                             },
-//                             node.inner.as_ref(),
-//                         ))
-//                     }
-//                     _ => {
-//                         let new_len = self.key.len();
-//                         self.key.extend(node.inner.as_bytes());
-//                         self.iters.push((new_len, node.children.iter()))
-//                     }
-//                 }
-//             } else if let Some((len, _)) = self.iters.pop() {
-//                 unsafe { self.key.set_len(len) }
-//             }
-//         }
-//     }
-// }
+pub struct Iter<'a, T, Matcher, const N: usize> {
+    key: Vec<u8>,
+    iters: Vec<(usize, std::slice::Iter<'a, GenericTrie<T, Matcher, { N }>>)>,
+}
+impl<'a, T, Matcher, const N: usize> IntoIterator for &'a GenericTrie<T, Matcher, { N }> {
+    type Item = (&'a [u8], &'a T);
+    type IntoIter = Iter<'a, T, Matcher, { N }>;
+    fn into_iter(self) -> Self::IntoIter {
+        let key = self.as_ref();
+        Iter {
+            key: key.into(),
+            iters: vec![(0, self.children.iter())],
+        }
+    }
+}
+impl<'a, T, Matcher, const N: usize> Iterator for Iter<'a, T, Matcher, { N }> {
+    type Item = (&'a [u8], &'a T);
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (_, iter) = self.iters.last_mut()?;
+            if let Some(node) = iter.next() {
+                let len = self.key.len();
+                self.key.extend(node.as_ref());
+                self.iters.push((len, node.children.iter()));
+                if node.holds_value() {
+                    return Some(unsafe {
+                        (
+                            std::slice::from_raw_parts(self.key.as_ptr(), self.key.len()),
+                            node.value.assume_init_ref(),
+                        )
+                    });
+                }
+            } else if let Some((len, _)) = self.iters.pop() {
+                unsafe { self.key.set_len(len) }
+            }
+        }
+    }
+}
 // pub struct IterMut<'a, T> {
 //     key: Vec<u8>,
 //     iters: Vec<(usize, std::slice::IterMut<'a, Trie<T>>)>,
@@ -761,236 +870,36 @@ impl<T, Tokenizer, const N: usize> AsRef<[u8]> for GenericTrie<T, Tokenizer, { N
 //     }
 // }
 
-// struct KeyTokenizer<'a> {
-//     key: &'a [u8],
-//     index: usize,
-// }
-// impl<'a> KeyTokenizer<'a> {
-//     fn new<S: AsRef<[u8]> + ?Sized>(key: &'a S) -> Self {
-//         KeyTokenizer {
-//             key: key.as_ref(),
-//             index: 0,
-//         }
-//     }
-//     fn token(key: &'a [u8], at: usize) -> (Option<Token<'a>>, usize) {
-//         let mut tokenizer = KeyTokenizer { key, index: at };
-//         let token = tokenizer.next();
-//         (token, tokenizer.index)
-//     }
-//     fn reset(&mut self) {
-//         self.index = 0
-//     }
-//     fn seek_end(&mut self) {
-//         self.index = self.key.len()
-//     }
-// }
-// impl<'a> Iterator for KeyTokenizer<'a> {
-//     type Item = Token<'a>;
-//     fn next(&mut self) -> Option<Self::Item> {
-//         let key = &self.key[self.index..];
-//         if key.is_empty() {
-//             return None;
-//         }
-//         match (key[0], key.get(1)) {
-//             (b'/', _) => {
-//                 self.index += 1;
-//                 Some(Token::SLASH)
-//             }
-//             (b'*', None) => {
-//                 self.index += 1;
-//                 Some(Token::STAR)
-//             }
-//             (b'*', Some(b'/')) => {
-//                 self.index += 2;
-//                 Some(Token::STAR)
-//             }
-//             (b'*', Some(b'*')) => match key.get(2) {
-//                 None => {
-//                     self.index += 2;
-//                     Some(Token::DOUBLE_STAR)
-//                 }
-//                 Some(b'/') => {
-//                     self.index += 3;
-//                     Some(Token::DOUBLE_STAR)
-//                 }
-//                 _ => {
-//                     if let Some(next_slash) = key.iter().position(|c| *c == b'/') {
-//                         self.index += next_slash;
-//                         Some(Token::from(&key[..next_slash]))
-//                     } else {
-//                         self.index = self.key.len();
-//                         Some(key.into())
-//                     }
-//                 }
-//             },
-//             _ => {
-//                 if let Some(next_slash) = key.iter().position(|c| *c == b'/') {
-//                     self.index += next_slash;
-//                     Some(Token::from(&key[..next_slash]))
-//                 } else {
-//                     self.index = self.key.len();
-//                     Some(key.into())
-//                 }
-//             }
-//         }
-//     }
-// }
-// impl<'a> DoubleEndedIterator for KeyTokenizer<'a> {
-//     fn next_back(&mut self) -> Option<Self::Item> {
-//         if self.index == 0 {
-//             return None;
-//         }
-//         match (
-//             self.key[self.index - 1],
-//             (self.index >= 2).then(|| self.key[self.index - 2]),
-//         ) {
-//             (b'*', Some(b'/')) | (b'*', None) => {
-//                 self.index -= 1;
-//                 Some(Token::STAR)
-//             }
-//             (b'*', Some(b'*')) if self.index == 2 || self.key[self.index - 3] == b'/' => {
-//                 self.index -= 2;
-//                 Some(Token::DOUBLE_STAR)
-//             }
-//             (b'/', Some(b'*')) if self.index == 2 || self.key[self.index - 3] == b'/' => {
-//                 self.index -= 2;
-//                 Some(Token::STAR)
-//             }
-//             (b'/', Some(b'*'))
-//                 if (self.index == 3 && self.key[self.index - 3] == b'*')
-//                     || (self.index > 3
-//                         && self.key[self.index - 3] == b'*'
-//                         && self.key[self.index - 4] == b'/') =>
-//             {
-//                 self.index -= 3;
-//                 Some(Token::DOUBLE_STAR)
-//             }
-//             (b'/', _) => {
-//                 self.index -= 1;
-//                 Some(Token::SLASH)
-//             }
-//             _ => {
-//                 let end = self.index;
-//                 for start in (0..end - 1).rev() {
-//                     if self.key[start] == b'/' {
-//                         self.index = start + 1;
-//                         return Some(Token::from(&self.key[self.index..end]));
-//                     }
-//                 }
-//                 self.index = 0;
-//                 Some(Token::from(&self.key[..end]))
-//             }
-//         }
-//     }
-// }
-// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// struct Token<'a> {
-//     start: *const u8,
-//     len: std::num::NonZeroUsize,
-//     lifetime: std::marker::PhantomData<&'a ()>,
-// }
-// impl<'a> std::fmt::Display for Token<'a> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         match *self {
-//             Self::DOUBLE_STAR => f.write_str("**/"),
-//             Self::STAR => f.write_str("*/"),
-//             Self::SLASH => f.write_str("/"),
-//             slice => f.write_str(std::str::from_utf8(slice.into()).unwrap()),
-//         }
-//     }
-// }
-// impl<'a> From<&'a [u8]> for Token<'a> {
-//     fn from(slice: &'a [u8]) -> Self {
-//         let start = slice.as_ptr();
-//         Token {
-//             start,
-//             len: std::num::NonZeroUsize::new(slice.len()).unwrap(),
-//             lifetime: std::marker::PhantomData,
-//         }
-//     }
-// }
-// impl<'a> From<Token<'a>> for &'a [u8] {
-//     fn from(slice: Token<'a>) -> Self {
-//         unsafe { std::slice::from_raw_parts(slice.start, slice.len.get()) }
-//     }
-// }
-// impl<'a> Token<'a> {
-//     const DOUBLE_STAR: Self = Token {
-//         start: std::ptr::null(),
-//         len: unsafe { std::num::NonZeroUsize::new_unchecked(3) },
-//         lifetime: std::marker::PhantomData,
-//     };
-//     const STAR: Self = Token {
-//         start: std::ptr::null(),
-//         len: unsafe { std::num::NonZeroUsize::new_unchecked(1) },
-//         lifetime: std::marker::PhantomData,
-//     };
-//     const SLASH: Self = Token {
-//         start: std::ptr::null(),
-//         len: unsafe { std::num::NonZeroUsize::new_unchecked(2) },
-//         lifetime: std::marker::PhantomData,
-//     };
-//     fn is_str(&self) -> bool {
-//         !self.start.is_null()
-//     }
-//     fn as_bytes(&'a self) -> &'a [u8] {
-//         unsafe { std::slice::from_raw_parts(self.start, self.len.get()) }
-//     }
-//     /// Splits a string token into 2 string tokens.
-//     /// # Safety
-//     /// This method performs no bounds checks, as requests to split a token only originate from contexts where bound checks have already been made
-//     unsafe fn split_unchecked(&mut self, at: u32) -> Self {
-//         let result = Token {
-//             start: self.start.offset(at as isize),
-//             len: std::num::NonZeroUsize::new_unchecked(self.len.get() - at as usize),
-//             lifetime: self.lifetime,
-//         };
-//         self.len = std::num::NonZeroUsize::new_unchecked(at as usize);
-//         result
-//     }
-// }
-
-// impl<T: Sized + std::fmt::Debug> std::fmt::Display for Trie<T> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         writeln!(f, "-{}", &self.inner)?;
-//         let mut stack = Vec::new();
-//         let mut prefix = "|".to_string();
-//         let mut iter = self.children.iter();
-//         loop {
-//             match iter.next() {
-//                 Some(next) => {
-//                     writeln!(f, "{}-{}", prefix, &next.inner)?;
-//                     if !next.children.is_empty() {
-//                         prefix += "|";
-//                         stack.push(iter);
-//                         iter = next.children.iter();
-//                     }
-//                 }
-//                 None => {
-//                     prefix.pop();
-//                     if let Some(next) = stack.pop() {
-//                         iter = next;
-//                     } else {
-//                         return Ok(());
-//                     }
-//                 }
-//             }
-//         }
-//     }
-// }
-// impl<T: Sized> From<TrieInner<T>> for Trie<T> {
-//     fn from(inner: TrieInner<T>) -> Self {
-//         Trie {
-//             inner,
-//             children: Vec::new(),
-//         }
-//     }
-// }
-// impl<T: Sized> Default for Trie<T> {
-//     fn default() -> Self {
-//         Self::new()
-//     }
-// }
+impl<T: Sized + std::fmt::Debug, Tokenizer, const N: usize> std::fmt::Display
+    for GenericTrie<T, Tokenizer, { N }>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "-{}", self.as_str())?;
+        let mut stack = Vec::new();
+        let mut prefix = "|".to_string();
+        let mut iter = self.children.iter();
+        loop {
+            match iter.next() {
+                Some(next) => {
+                    writeln!(f, "{}-{}", prefix, next.as_str())?;
+                    if !next.children.is_empty() {
+                        prefix += "|";
+                        stack.push(iter);
+                        iter = next.children.iter();
+                    }
+                }
+                None => {
+                    prefix.pop();
+                    if let Some(next) = stack.pop() {
+                        iter = next;
+                    } else {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
 
 // struct TrieInnerUnion<T> {
 //     bytes: [u8; INNER_SIZE],
@@ -1264,16 +1173,11 @@ fn trie_panic_if_too_large() {
     assert_ne!(std::mem::size_of_val(&impossible_trie), 64);
 }
 
-/// Ensures that any Trie<T> has the exact size of a typical cache line.
-#[test]
-fn trie_check_size() {
-    static_assert_eqsize!(Trie<&str, 16>, [u8; 64]);
-}
-
 #[test]
 fn trie_general() {
-    let mut trie: Trie<String, 8> = Trie::new();
-    static_assert_eqsize!(Trie<String, 8>, [u8; 64]);
+    type STrie = Trie<String, 15>;
+    let mut trie: STrie = Trie::new();
+    const _: [u64; 8] = unsafe { std::mem::transmute(std::mem::transmute::<_, STrie>([0u64; 8])) };
     let keys: [&str; 5] = [
         "/panda",
         "/patate/douce",
@@ -1284,14 +1188,16 @@ fn trie_general() {
     for key in keys {
         assert!(trie.insert(key, key.to_uppercase()).is_none());
     }
-    // for (key, value) in &trie {
-    //     let key = std::str::from_utf8(key).unwrap();
-    //     assert!(keys.contains(&key));
-    //     assert_eq!(&key.to_uppercase(), value);
-    // }
-    // for key in keys {
-    //     assert_eq!(trie.get(key).unwrap(), &key.to_uppercase());
-    // }
+    println!("{:?}", &trie);
+    println!("{}", &trie);
+    for (key, value) in &trie {
+        let key = std::str::from_utf8(key).unwrap();
+        assert!(keys.contains(&dbg!(key)));
+        assert_eq!(&key.to_uppercase(), value);
+    }
+    for key in keys {
+        assert_eq!(trie.get(key).unwrap(), &key.to_uppercase());
+    }
     // for key in keys.iter().filter(|p| !p.starts_with("/panda")) {
     //     assert_eq!(trie.remove(key).unwrap(), key.to_uppercase());
     // }
