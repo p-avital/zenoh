@@ -520,7 +520,6 @@ pub const PROP_STARTTIME: &str = "starttime";
 /// The "stoptime" property key for time-range selection
 pub const PROP_STOPTIME: &str = "stoptime";
 
-#[derive(Clone, Debug, PartialEq)]
 /// An expression identifying a selection of resources.
 ///
 /// A selector is the conjunction of an key expression identifying a set
@@ -545,6 +544,7 @@ pub const PROP_STOPTIME: &str = "stoptime";
 ///    will be used in place of the original value.
 ///
 /// _**NOTE**_: _the filters and fragments are not yet supported in current zenoh version._
+#[derive(Clone, Debug, PartialEq)]
 pub struct Selector<'a> {
     /// The part of this selector identifying which keys should be part of the selection.
     /// I.e. all characters before `?`.
@@ -615,8 +615,8 @@ impl<'a> From<&'a Query> for Selector<'a> {
     }
 }
 
-impl<'a> From<&KeyExpr<'a>> for Selector<'a> {
-    fn from(key_selector: &KeyExpr<'a>) -> Self {
+impl<'a> From<&'a KeyExpr<'a>> for Selector<'a> {
+    fn from(key_selector: &'a KeyExpr<'a>) -> Self {
         Self {
             key_selector: key_selector.clone(),
             value_selector: "",

@@ -348,9 +348,10 @@ impl<'a> KeyExpr<'a> {
     }
 
     pub fn to_owned(&self) -> KeyExpr<'static> {
+        let suffix = self.suffix.clone().into_owned();
         KeyExpr {
             scope: self.scope,
-            suffix: self.suffix.to_string().into(),
+            suffix: Cow::Owned(suffix),
         }
     }
 
