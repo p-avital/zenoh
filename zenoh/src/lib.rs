@@ -104,7 +104,7 @@ const GIT_VERSION: &str = git_version!(prefix = "v", cargo_prefix = "v");
 
 #[macro_use]
 mod session;
-mod buffers;
+pub mod buffers;
 pub use session::*;
 
 #[doc(hidden)]
