@@ -3224,6 +3224,7 @@ dependencies = [
  "bincode",
  "clap",
  "criterion",
+ "derive_more",
  "env_logger",
  "event-listener",
  "flume",
