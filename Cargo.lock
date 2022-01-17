@@ -2601,6 +2601,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "splitable-buffers"
+version = "0.1.0"
+source = "git+https://github.com/atolab/split-buffers.git#10bd38dd472a8344d9d4c46374c21db1b866b354"
+
+[[package]]
 name = "standback"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3253,6 +3258,7 @@ dependencies = [
  "serde_yaml",
  "shared_memory",
  "socket2 0.4.2",
+ "splitable-buffers",
  "uhlc",
  "uuid",
  "validated_struct",

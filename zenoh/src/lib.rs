@@ -109,6 +109,7 @@ pub use session::*;
 #[doc(hidden)]
 pub mod net;
 
+pub mod buffers;
 pub mod config;
 pub mod info;
 pub mod prelude;
