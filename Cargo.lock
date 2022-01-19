@@ -2603,7 +2603,7 @@ dependencies = [
 [[package]]
 name = "splitable-buffers"
 version = "0.1.0"
-source = "git+https://github.com/atolab/split-buffers.git#10bd38dd472a8344d9d4c46374c21db1b866b354"
+source = "git+https://github.com/atolab/split-buffers.git#cf47423e551b992c038716201d494fc175fe3d39"
 
 [[package]]
 name = "standback"
